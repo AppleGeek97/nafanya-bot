@@ -2,12 +2,14 @@ package aihandler
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"strings"
 
 	"cloud.google.com/go/vertexai/genai"
 	"github.com/getsentry/sentry-go"
+	"github.com/shabablinchikow/nafanya-bot/internal/cfg"
 	"github.com/sashabaranov/go-openai"
 	genaisdk "google.golang.org/genai"
 	"mvdan.cc/xurls/v2"
@@ -31,26 +33,31 @@ func NewHandler(oai *openai.Client, googleAI *genai.Client, deep *openai.Client,
 
 func (h *Handler) GetPromptResponse(prompt string, userInput string, model string, maxTokens int) (string, error) {
 	switch model {
-	case "oai":
+	case string(cfg.AIModelGPT55):
 		return h.GetPromptResponseOAI(prompt, userInput, maxTokens)
-	case "deepseek":
+	case string(cfg.AIModelDeepSeekV4):
 		return h.GetPromptResponseDS(prompt, userInput, maxTokens)
-	case "google":
+	case string(cfg.AIModelGemini35):
 		return h.GetPromptResponseGoogle(prompt, userInput, maxTokens)
 	}
 
-	return "", fmt.Errorf("unknown model: %s", model)
+	// Unknown/stale model (e.g. legacy "google" left in the DB) — fall back to the
+	// default model instead of failing the reply. DefaultAIModel() is always valid,
+	// so this recurses at most once.
+	log.Printf("unknown model %q, falling back to default %s", model, cfg.DefaultAIModel())
+	return h.GetPromptResponse(prompt, userInput, string(cfg.DefaultAIModel()), maxTokens)
 }
 
 func (h *Handler) GetPromptResponseOAI(prompt string, userInput string, maxTokens int) (string, error) {
-	return h.GetPromptResponseOAICommon(h.aiOAI, prompt, userInput, maxTokens, "gpt-5")
+	// gpt-5.5 rejects max_tokens and requires max_completion_tokens
+	return h.GetPromptResponseOAICommon(h.aiOAI, prompt, userInput, maxTokens, cfg.GetAIModelBackendName(cfg.AIModelGPT55), true)
 }
 
 func (h *Handler) GetPromptResponseDS(prompt string, userInput string, maxTokens int) (string, error) {
-	return h.GetPromptResponseOAICommon(h.deepSeek, prompt, userInput, maxTokens, "deepseek-chat")
+	return h.GetPromptResponseOAICommon(h.deepSeek, prompt, userInput, maxTokens, cfg.GetAIModelBackendName(cfg.AIModelDeepSeekV4), false)
 }
 
-func (h *Handler) GetPromptResponseOAICommon(client *openai.Client, prompt string, userInput string, maxTokens int, model string) (string, error) {
+func (h *Handler) GetPromptResponseOAICommon(client *openai.Client, prompt string, userInput string, maxTokens int, model string, useCompletionTokens bool) (string, error) {
 	if client == nil {
 		return "", fmt.Errorf("model not available")
 	}
@@ -65,13 +72,17 @@ func (h *Handler) GetPromptResponseOAICommon(client *openai.Client, prompt strin
 		Content: userInput,
 	})
 
-	resp, err := client.CreateChatCompletion(
-		context.Background(),
-		openai.ChatCompletionRequest{
-			Model:     model,
-			Messages:  messages,
-			MaxTokens: maxTokens,
-		})
+	req := openai.ChatCompletionRequest{
+		Model:    model,
+		Messages: messages,
+	}
+	if useCompletionTokens {
+		req.MaxCompletionTokens = maxTokens
+	} else {
+		req.MaxTokens = maxTokens
+	}
+
+	resp, err := client.CreateChatCompletion(context.Background(), req)
 	if err != nil {
 		sentry.CaptureException(err)
 		log.Println("Completion error:", err)
@@ -93,7 +104,6 @@ func (h *Handler) GetPromptResponseGoogle(prompt string, userInput string, maxTo
 	return h.getPromptResponseVertexAI(prompt, userInput, maxTokens)
 }
 
-const geminiModel = "gemini-3.1-pro-preview"
 const geminiRetries = 3
 
 // extractYouTubeURLs finds YouTube URLs in userInput, returns them and the cleaned text.
@@ -113,7 +123,7 @@ func extractYouTubeURLs(userInput string) ([]string, string) {
 
 func (h *Handler) getPromptResponseGeminiDirect(prompt string, userInput string, _ int) (string, error) {
 
-	cfg := &genaisdk.GenerateContentConfig{
+	geminiCfg := &genaisdk.GenerateContentConfig{
 		SystemInstruction: genaisdk.NewContentFromText(prompt, "user"),
 		SafetySettings: []*genaisdk.SafetySetting{
 			{Category: genaisdk.HarmCategoryHarassment, Threshold: genaisdk.HarmBlockThresholdBlockOnlyHigh},
@@ -135,9 +145,9 @@ func (h *Handler) getPromptResponseGeminiDirect(prompt string, userInput string,
 	for i := range geminiRetries {
 		resp, err := h.geminiDirect.Models.GenerateContent(
 			context.Background(),
-			geminiModel,
+			cfg.GetAIModelBackendName(cfg.AIModelGemini35),
 			contents,
-			cfg,
+			geminiCfg,
 		)
 		if err != nil {
 			log.Printf("Gemini attempt %d error: %v", i+1, err)
@@ -151,7 +161,7 @@ func (h *Handler) getPromptResponseGeminiDirect(prompt string, userInput string,
 
 
 func (h *Handler) getPromptResponseVertexAI(prompt string, userInput string, maxTokens int) (string, error) {
-	model := h.aiGoogle.GenerativeModel("gemini-2.0-flash-001")
+	model := h.aiGoogle.GenerativeModel(cfg.VertexAIModel())
 
 	model.SafetySettings = []*genai.SafetySetting{
 		{Category: genai.HarmCategoryHarassment, Threshold: genai.HarmBlockOnlyHigh},
@@ -193,13 +203,14 @@ func (h *Handler) GetImageFromPromptBanana(prompt string) ([]byte, string, error
 		return nil, "", fmt.Errorf("banana unavailable: GEMINI_DIRECT_KEY not configured")
 	}
 
-	resp, err := h.geminiDirect.Models.GenerateImages(
+	// gemini-*-flash-image generates images via GenerateContent (image modality),
+	// not GenerateImages (the Imagen predict endpoint, which 404s for gemini models)
+	resp, err := h.geminiDirect.Models.GenerateContent(
 		context.Background(),
-		"imagen-4.0-fast-generate-001",
-		prompt,
-		&genaisdk.GenerateImagesConfig{
-			NumberOfImages: 1,
-			OutputMIMEType: "image/jpeg",
+		cfg.GetImageModelBackendName(cfg.ImageModelGemini31),
+		genaisdk.Text(prompt),
+		&genaisdk.GenerateContentConfig{
+			ResponseModalities: []string{"IMAGE"},
 		},
 	)
 	if err != nil {
@@ -207,35 +218,46 @@ func (h *Handler) GetImageFromPromptBanana(prompt string) ([]byte, string, error
 		return nil, "", err
 	}
 
-	if len(resp.GeneratedImages) == 0 || resp.GeneratedImages[0].Image == nil {
-		return nil, "", fmt.Errorf("no image data returned from Imagen")
+	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
+		return nil, "", fmt.Errorf("no image data returned from gemini")
 	}
 
-	img := resp.GeneratedImages[0].Image
-	return img.ImageBytes, img.MIMEType, nil
+	for _, part := range resp.Candidates[0].Content.Parts {
+		if part.InlineData != nil && len(part.InlineData.Data) > 0 {
+			return part.InlineData.Data, part.InlineData.MIMEType, nil
+		}
+	}
+
+	return nil, "", fmt.Errorf("no image data returned from gemini")
 }
 
-func (h *Handler) GetImageFromPrompt(prompt string) (string, error) {
+func (h *Handler) GetImageFromPrompt(prompt string) ([]byte, string, error) {
+	// ponytail: gpt-image-* rejects response_format and always returns b64_json
 	img, err := h.aiOAI.CreateImage(context.Background(),
 		openai.ImageRequest{
-			Prompt:         prompt,
-			N:              1,
-			Size:           openai.CreateImageSize1792x1024,
-			ResponseFormat: openai.CreateImageResponseFormatURL,
-			Quality:        openai.CreateImageQualityHD,
-			Model:          "gpt-image-1.5",
+			Prompt:  prompt,
+			N:       1,
+			Size:    openai.CreateImageSize1536x1024,
+			Quality: openai.CreateImageQualityHigh,
+			Model:   cfg.GetImageModelBackendName(cfg.ImageModelGPTImage2),
 		})
 	if err != nil {
 		sentry.CaptureException(err)
 		log.Println("Image error:", err)
-		return "", err
+		return nil, "", err
 	}
 
-	if len(img.Data) == 0 {
+	if len(img.Data) == 0 || img.Data[0].B64JSON == "" {
 		err := fmt.Errorf("no image data returned from API")
 		sentry.CaptureException(err)
-		return "", err
+		return nil, "", err
 	}
 
-	return img.Data[0].URL, nil
+	data, err := base64.StdEncoding.DecodeString(img.Data[0].B64JSON)
+	if err != nil {
+		sentry.CaptureException(err)
+		return nil, "", err
+	}
+
+	return data, "image/png", nil
 }
