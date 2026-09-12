@@ -222,17 +222,6 @@ func (h *Handler) sendImageByBytes(update tgbotapi.Update, data []byte, mimeType
 	}
 }
 
-func (h *Handler) sendImageByURL(update tgbotapi.Update, url string) {
-	photo := tgbotapi.NewPhoto(update.Message.Chat.ID, tgbotapi.FileURL(url))
-	photo.ReplyToMessageID = update.Message.MessageID
-
-	_, err := h.bot.Send(photo)
-	if err != nil {
-		sentry.CaptureException(err)
-		log.Println(err)
-	}
-}
-
 func (h *Handler) sendAction(update tgbotapi.Update, action string) {
 	msg := tgbotapi.NewChatAction(update.Message.Chat.ID, action)
 
