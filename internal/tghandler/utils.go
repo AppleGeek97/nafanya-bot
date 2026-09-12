@@ -83,11 +83,25 @@ func (h *Handler) isItTime(chat int64) bool {
 	return false
 }
 
+// isPhotoMessage reports whether a message carries a photo. Telegram sends a
+// photo as a slice of sizes rather than a single field, so an empty slice means
+// there is no image.
+func isPhotoMessage(message *tgbotapi.Message) bool {
+	return message != nil && len(message.Photo) > 0
+}
+
 func (h *Handler) isPersonal(update tgbotapi.Update) bool {
 	if strings.HasPrefix(update.Message.Text, "Нафаня") || strings.HasPrefix(update.Message.Text, "нафаня") || strings.HasPrefix(update.Message.Text, "@grok") {
 		return true
 	} else if update.Message.ReplyToMessage != nil && !h.checkIfURLReply(update) {
-		return update.Message.ReplyToMessage.From.ID == h.bot.Self.ID
+		if update.Message.ReplyToMessage.From.ID != h.bot.Self.ID {
+			return false
+		}
+		// A picture Nafanya just drew ends the exchange. Replies under it are
+		// people reacting to the image, not asking him anything, so answering
+		// every one of them turns a drawing into a thread. Addressing him by
+		// name still works: that is handled above, before this branch.
+		return !isPhotoMessage(update.Message.ReplyToMessage)
 	}
 	return false
 }
