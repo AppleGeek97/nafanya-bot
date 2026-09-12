@@ -104,7 +104,12 @@ func isDrawAny(update tgbotapi.Update) bool {
 }
 
 func isSerious(update tgbotapi.Update) bool {
-	return strings.Contains(update.Message.Text, "серьезно")
+	// Matched case-insensitively, and with ё folded to е, so "Серьёзно" and
+	// "СЕРЬЕЗНО" count the same as "серьезно". Both spellings are common and
+	// phone keyboards disagree about which one they produce.
+	text := strings.ToLower(update.Message.Text)
+	text = strings.ReplaceAll(text, "ё", "е")
+	return strings.Contains(text, "серьезно")
 }
 
 func getCleanDrawPrompt(update string) string {
